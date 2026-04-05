@@ -545,6 +545,10 @@ def _try_workspace_and_org_selection(
         logger.warning(f"[线程 {thread_id}] [警告] 选择 workspace 失败，状态码: {select_resp.status_code}")
         continue_url = extract_continue_url_from_response(select_resp)
         if continue_url:
+            if oauth is not None:
+                token_json = follow_oauth_redirect_chain(session, continue_url, oauth, thread_id)
+                if token_json:
+                    return token_json
             token_json = _finalize_chatgpt_web_callback(
                 session,
                 continue_url,
@@ -553,15 +557,11 @@ def _try_workspace_and_org_selection(
             )
             if token_json:
                 return token_json
-            if oauth is not None:
-                token_json = follow_oauth_redirect_chain(session, continue_url, oauth, thread_id)
-                if token_json:
-                    return token_json
-                return _extract_token_from_web_session(
-                    session,
-                    thread_id,
-                    proxy_url=proxy_url,
-                )
+            return _extract_token_from_web_session(
+                session,
+                thread_id,
+                proxy_url=proxy_url,
+            )
         return None
 
     try:
@@ -593,6 +593,10 @@ def _try_workspace_and_org_selection(
             if org_resp.status_code == 200 or 300 <= org_resp.status_code < 400:
                 org_continue_url = extract_continue_url_from_response(org_resp)
                 if org_continue_url:
+                    if oauth is not None:
+                        token_json = follow_oauth_redirect_chain(session, org_continue_url, oauth, thread_id)
+                        if token_json:
+                            return token_json
                     token_json = _finalize_chatgpt_web_callback(
                         session,
                         org_continue_url,
@@ -601,15 +605,11 @@ def _try_workspace_and_org_selection(
                     )
                     if token_json:
                         return token_json
-                    if oauth is not None:
-                        token_json = follow_oauth_redirect_chain(session, org_continue_url, oauth, thread_id)
-                        if token_json:
-                            return token_json
-                        return _extract_token_from_web_session(
-                            session,
-                            thread_id,
-                            proxy_url=proxy_url,
-                        )
+                    return _extract_token_from_web_session(
+                        session,
+                        thread_id,
+                        proxy_url=proxy_url,
+                    )
             logger.warning(
                 f"[线程 {thread_id}] [警告] 选择 organization 失败，状态码: {org_resp.status_code}"
             )
@@ -620,21 +620,16 @@ def _try_workspace_and_org_selection(
         return None
 
     logger.info(f"[线程 {thread_id}] [信息] 已获取 workspace，继续跟随授权跳转链")
+    if oauth is not None:
+        token_json = follow_oauth_redirect_chain(session, continue_url, oauth, thread_id)
+        if token_json:
+            return token_json
     token_json = _finalize_chatgpt_web_callback(
         session,
         continue_url,
         thread_id,
         proxy_url=proxy_url,
     )
-    if token_json:
-        return token_json
-    if oauth is None:
-        return _extract_token_from_web_session(
-            session,
-            thread_id,
-            proxy_url=proxy_url,
-        )
-    token_json = follow_oauth_redirect_chain(session, continue_url, oauth, thread_id)
     if token_json:
         return token_json
     return _extract_token_from_web_session(
@@ -677,14 +672,6 @@ def try_token_via_continue_url(
     if not candidate:
         return None
     logger.info(f"[线程 {thread_id}] [信息] 尝试直接跟随 continue_url 获取 token")
-    token_json = _finalize_chatgpt_web_callback(
-        session,
-        candidate,
-        thread_id,
-        proxy_url=proxy_url,
-    )
-    if token_json:
-        return token_json
     callback_url = _extract_callback_url(candidate)
     if callback_url:
         try:
@@ -697,6 +684,14 @@ def try_token_via_continue_url(
         except Exception as exc:
             logger.warning(f"[线程 {thread_id}] [警告] continue_url 直接回调换 token 失败: {exc}")
     token_json = follow_oauth_redirect_chain(session, candidate, oauth, thread_id)
+    if token_json:
+        return token_json
+    token_json = _finalize_chatgpt_web_callback(
+        session,
+        candidate,
+        thread_id,
+        proxy_url=proxy_url,
+    )
     if token_json:
         return token_json
     auth_cookie = str(session.cookies.get("oai-client-auth-session") or "").strip()
@@ -1201,14 +1196,6 @@ def try_token_via_password_login(
         callback_url = _extract_callback_url_from_exception(exc)
         if callback_url:
             try:
-                token_json = _finalize_chatgpt_web_callback(
-                    login_session,
-                    callback_url,
-                    thread_id,
-                    proxy_url=proxy_url,
-                )
-                if token_json:
-                    return token_json
                 return submit_callback_url(
                     callback_url=callback_url,
                     expected_state=login_oauth.state,
@@ -1216,6 +1203,16 @@ def try_token_via_password_login(
                     redirect_uri=login_oauth.redirect_uri,
                 )
             except Exception:
-                pass
+                try:
+                    token_json = _finalize_chatgpt_web_callback(
+                        login_session,
+                        callback_url,
+                        thread_id,
+                        proxy_url=proxy_url,
+                    )
+                    if token_json:
+                        return token_json
+                except Exception:
+                    pass
         logger.warning(f"[线程 {thread_id}] [警告] 账号密码登录兜底失败: {exc}")
         return None
