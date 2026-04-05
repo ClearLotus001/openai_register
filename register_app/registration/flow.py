@@ -40,6 +40,7 @@ from ..auth.token import (
 )
 from .common import (
     RegistrationAttemptResult,
+    _accept_codex_token,
     _build_random_signup_profile,
     _build_request_proxies,
     _enrich_token_json,
@@ -587,77 +588,96 @@ def _run_http(
         token_json = None
         token_source = ""
 
+        def _accept_token(candidate: Optional[str], source: str) -> Optional[str]:
+            nonlocal token_source
+            accepted = _accept_codex_token(
+                candidate,
+                thread_id=thread_id,
+                source=source,
+                metadata=result.metadata,
+            )
+            if accepted:
+                token_source = source
+            return accepted
+
         if post_create_continue_url:
             _set_stage("token_continue_url")
-            token_json = try_token_via_continue_url(
-                s,
-                oauth,
-                post_create_continue_url,
-                thread_id,
-                proxy_url=proxy or "",
+            token_json = _accept_token(
+                try_token_via_continue_url(
+                    s,
+                    oauth,
+                    post_create_continue_url,
+                    thread_id,
+                    proxy_url=proxy or "",
+                ),
+                "create_account_continue",
             )
-            if token_json:
-                token_source = "create_account_continue"
 
         if not token_json and post_otp_continue_url:
             _set_stage("token_continue_url_after_otp")
-            token_json = try_token_via_continue_url(
-                s,
-                oauth,
-                post_otp_continue_url,
-                thread_id,
-                proxy_url=proxy or "",
+            token_json = _accept_token(
+                try_token_via_continue_url(
+                    s,
+                    oauth,
+                    post_otp_continue_url,
+                    thread_id,
+                    proxy_url=proxy or "",
+                ),
+                "email_otp_continue",
             )
-            if token_json:
-                token_source = "email_otp_continue"
 
         if not token_json:
             _set_stage("token_session_cookie")
-            token_json = try_token_via_session_cookie(s, thread_id, proxy_url=proxy or "")
-            if token_json:
-                token_source = "session_cookie"
+            token_json = _accept_token(
+                try_token_via_session_cookie(s, thread_id, proxy_url=proxy or ""),
+                "session_cookie",
+            )
 
         if not token_json:
             _set_stage("token_workspace_select")
             auth_cookie = str(s.cookies.get("oai-client-auth-session") or "").strip()
-            token_json = try_token_via_workspace_select(
-                s,
-                oauth,
-                auth_cookie,
-                thread_id,
-                proxy_url=proxy or "",
+            token_json = _accept_token(
+                try_token_via_workspace_select(
+                    s,
+                    oauth,
+                    auth_cookie,
+                    thread_id,
+                    proxy_url=proxy or "",
+                ),
+                "workspace_select",
             )
-            if token_json:
-                token_source = "workspace_select"
 
         if not token_json:
             _set_stage("token_existing_session")
-            token_json = try_token_via_existing_session(s, oauth, thread_id)
-            if token_json:
-                token_source = "existing_session"
+            token_json = _accept_token(
+                try_token_via_existing_session(s, oauth, thread_id),
+                "existing_session",
+            )
 
         if not token_json:
             _set_stage("token_session_api")
-            token_json = try_token_via_session_api(s, thread_id)
-            if token_json:
-                token_source = "session_api"
+            token_json = _accept_token(
+                try_token_via_session_api(s, thread_id),
+                "session_api",
+            )
 
         if not token_json:
             _set_stage("token_password_login")
-            token_json = try_token_via_password_login(
-                email=email,
-                password=password,
-                mailbox=mailbox,
-                used_codes={code} if code else set(),
-                oauth=oauth,
-                proxies=proxies,
-                impersonate=current_impersonate,
-                thread_id=thread_id,
-                get_oai_code_fn=get_oai_code,
-                get_mailbox_message_snapshot_fn=get_mailbox_message_snapshot,
+            token_json = _accept_token(
+                try_token_via_password_login(
+                    email=email,
+                    password=password,
+                    mailbox=mailbox,
+                    used_codes={code} if code else set(),
+                    oauth=oauth,
+                    proxies=proxies,
+                    impersonate=current_impersonate,
+                    thread_id=thread_id,
+                    get_oai_code_fn=get_oai_code,
+                    get_mailbox_message_snapshot_fn=get_mailbox_message_snapshot,
+                ),
+                "password_login",
             )
-            if token_json:
-                token_source = "password_login"
 
         if token_json:
             result.metadata["token_source"] = token_source or "unknown"
@@ -691,17 +711,17 @@ def _run_http(
             return _fail(
                 "add_phone_gate",
                 "post_create_add_phone_gate",
-                "注册流程已走到 add-phone gate，当前自动 token 提取失败",
+                "注册流程已走到 add-phone gate，当前自动 codex token 提取失败",
                 deferred_credentials=deferred_credentials,
                 post_create_continue_url=post_create_continue_url,
                 post_create_gate=post_create_gate,
             )
 
-        logger.error(f"[线程 {thread_id}] [错误] 已完成注册，但仍未能获取 OAuth token")
+        logger.error(f"[线程 {thread_id}] [错误] 已完成注册，但仍未能获取 codex token")
         return _fail(
             "token_finalize",
             "token_extraction_failed",
-            "已完成注册，但仍未能获取可用 token",
+            "已完成注册，但仍未能获取可用 codex token",
         )
 
     except Exception as e:
@@ -769,7 +789,13 @@ def run(
             proxy_url=str(proxy or "").strip(),
             thread_id=thread_id,
         )
-        if browser_oauth_result:
+        browser_oauth_token_json = _accept_codex_token(
+            browser_oauth_result.token_json if browser_oauth_result else None,
+            thread_id=thread_id,
+            source="browser_oauth_fallback",
+            metadata=result.metadata,
+        )
+        if browser_oauth_result and browser_oauth_token_json:
             mailbox = _mailbox_from_private_context(
                 result.private_context.get("mailbox"),
                 fallback_email=result.email,
@@ -784,7 +810,7 @@ def run(
             result.error_code = ""
             result.error_message = ""
             result.token_json = _enrich_token_json(
-                browser_oauth_result.token_json,
+                browser_oauth_token_json,
                 session=None,
                 mailbox=mailbox,
                 provider_key=provider_key,

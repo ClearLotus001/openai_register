@@ -28,6 +28,7 @@ from ..mail.dedupe import get_mailbox_dedupe_store
 from ..mail.providers import TempMailbox
 from .common import (
     RegistrationAttemptResult,
+    _accept_codex_token,
     _build_random_signup_profile,
     _build_request_proxies,
     _enrich_token_json,
@@ -417,11 +418,17 @@ def run_browser(
             reuse_profile_id=profile_id,
             close_profile=False,
         )
-        if not browser_oauth_result:
+        browser_oauth_token_json = _accept_codex_token(
+            browser_oauth_result.token_json if browser_oauth_result else None,
+            thread_id=thread_id,
+            source="browser_signup_oauth",
+            metadata=result.metadata,
+        )
+        if not browser_oauth_result or not browser_oauth_token_json:
             return _fail(
                 "token_finalize",
                 "token_extraction_failed",
-                "browser registration 已完成，但 browser OAuth fallback 未获取到 token",
+                "browser registration 已完成，但 browser OAuth fallback 未获取到 codex token",
             )
 
         result.metadata.update(browser_oauth_result.metadata)
@@ -433,7 +440,7 @@ def run_browser(
         result.error_code = ""
         result.error_message = ""
         result.token_json = _enrich_token_json(
-            browser_oauth_result.token_json,
+            browser_oauth_token_json,
             session=None,
             mailbox=mailbox,
             provider_key=provider_key,

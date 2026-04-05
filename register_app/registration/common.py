@@ -364,6 +364,49 @@ def _extract_session_token_from_session(session: Any) -> str:
     return ""
 
 
+def _token_payload_type(token_json: str) -> str:
+    try:
+        payload = json.loads(str(token_json or "").strip())
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("type") or "").strip()
+
+
+def _accept_codex_token(
+    token_json: Optional[str],
+    *,
+    thread_id: int,
+    source: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    candidate = str(token_json or "").strip()
+    if not candidate:
+        return None
+
+    token_type = _token_payload_type(candidate)
+    if token_type.lower() == "codex":
+        if isinstance(metadata, dict):
+            metadata[f"{source}_token_type"] = token_type
+        return candidate
+
+    logger.warning(
+        f"[线程 {thread_id}] [警告] {source} 拿到的 token 类型不是 codex，已忽略: "
+        f"type={token_type or 'unknown'}"
+    )
+    if isinstance(metadata, dict):
+        rejected = metadata.setdefault("rejected_token_candidates", [])
+        if isinstance(rejected, list):
+            rejected.append(
+                {
+                    "source": str(source or "").strip(),
+                    "type": token_type or "unknown",
+                }
+            )
+    return None
+
+
 def _enrich_token_json(
     token_json: str,
     *,
@@ -398,6 +441,7 @@ __all__ = [
     "RegistrationAttemptResult",
     "_build_random_signup_profile",
     "_build_request_proxies",
+    "_accept_codex_token",
     "_enrich_token_json",
     "_extract_session_token_from_session",
     "_extract_response_error_code_message",
