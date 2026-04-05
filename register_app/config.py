@@ -9,7 +9,8 @@ import ctypes
 import json
 import logging
 import os
-from typing import Dict
+import sys
+from typing import Dict, Iterable, Optional, Set
 
 logger = logging.getLogger("openai_register")
 
@@ -56,6 +57,7 @@ DEFAULT_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "monitor_config.json")
 _CONFIG_KEY_MAP: Dict[str, str] = {
     "proxy": "proxy",
     "mail_provider": "mail_provider",
+    "mail_providers": "mail_providers",
     "cfmail_profile": "cfmail_profile",
     "cfmail_config": "cfmail_config",
     "cfmail_worker_domain": "cfmail_worker_domain",
@@ -100,6 +102,18 @@ _CONFIG_BOOL_KEYS = {
     "test_cfmail",
 }
 
+# 某些 CLI 参数存在“模式/来源”互斥关系：
+# - 显式传了 --register-only / --once 时，不应再让配置文件里的 monitor 抢回控制权
+# - 显式传了 --mail-provider 时，不应再让配置文件里的 mail_providers 覆盖
+_CONFIG_EXPLICIT_OVERRIDE_KEYS: Dict[str, Set[str]] = {
+    "mail_provider": {"mail_provider", "mail_providers"},
+    "mail_providers": {"mail_provider", "mail_providers"},
+    "monitor": {"monitor", "monitor_once", "register_only", "once"},
+    "monitor_once": {"monitor", "monitor_once", "register_only", "once"},
+    "register_only": {"monitor", "monitor_once", "register_only"},
+    "once": {"monitor", "monitor_once", "once"},
+}
+
 
 # ---------------------------------------------------------------------------
 # 配置文件加载
@@ -122,10 +136,52 @@ def load_config_file(config_path: str) -> dict:
         return {}
 
 
-def apply_config_to_args(args: argparse.Namespace, config: dict) -> None:
+def collect_explicit_cli_dests(
+    parser: argparse.ArgumentParser,
+    argv: Optional[Iterable[str]] = None,
+) -> Set[str]:
+    """收集本次命令行中被显式传入的 argparse dest。"""
+    tokens = [str(item) for item in (list(argv) if argv is not None else sys.argv[1:])]
+    explicit_dests: Set[str] = set()
+
+    for action in parser._actions:
+        option_strings = getattr(action, "option_strings", None) or ()
+        for option_string in option_strings:
+            if any(
+                token == option_string or token.startswith(f"{option_string}=")
+                for token in tokens
+            ):
+                explicit_dests.add(str(action.dest))
+                break
+
+    return explicit_dests
+
+
+def _config_key_blocked_by_cli(
+    config_key: str,
+    arg_dest: str,
+    explicit_cli_dests: Set[str],
+) -> bool:
+    if not explicit_cli_dests:
+        return False
+    override_keys = set(_CONFIG_EXPLICIT_OVERRIDE_KEYS.get(config_key, set()))
+    override_keys.add(str(arg_dest))
+    return bool(override_keys.intersection(explicit_cli_dests))
+
+
+def apply_config_to_args(
+    args: argparse.Namespace,
+    config: dict,
+    *,
+    explicit_cli_dests: Optional[Iterable[str]] = None,
+) -> None:
     """将配置文件中的值填入 args，仅当命令行未显式指定时生效。"""
+    explicit_dest_set = {str(item) for item in (explicit_cli_dests or set())}
+
     for config_key, arg_dest in _CONFIG_KEY_MAP.items():
         if config_key not in config:
+            continue
+        if _config_key_blocked_by_cli(config_key, arg_dest, explicit_dest_set):
             continue
         # 仅当 argparse 使用了默认值时才覆盖（命令行显式指定的优先）
         current_val = getattr(args, arg_dest, None)
@@ -135,6 +191,8 @@ def apply_config_to_args(args: argparse.Namespace, config: dict) -> None:
 
     for bool_key in _CONFIG_BOOL_KEYS:
         if bool_key not in config:
+            continue
+        if _config_key_blocked_by_cli(bool_key, bool_key, explicit_dest_set):
             continue
         current_val = getattr(args, bool_key, False)
         if not current_val:

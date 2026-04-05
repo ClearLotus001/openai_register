@@ -110,6 +110,7 @@ sudo systemctl status openai-register
 - `active_token_dir`
 - `active_min_count`
 - `mail_provider`
+- `mail_providers`
 - `proxy`
 - `monitor_interval`
 - `register_batch_size`
@@ -151,6 +152,13 @@ sudo systemctl status openai-register
 python openai_register.py --doctor
 python openai_register.py --status
 ```
+
+多邮箱 provider 并行：
+
+- 默认只使用 `mail_provider`
+- 若配置 `mail_providers`（JSON 数组）或使用 `--mail-providers cfmail,tempmaillol,mailtm`
+  - 注册线程会按 provider 列表轮转分配
+  - 在有多个注册线程/批次时，不同邮箱服务会并行执行
 
 ## 默认节流策略
 

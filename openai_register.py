@@ -68,6 +68,7 @@ from register_app.config import (
     DEFAULT_TOKEN_OUTPUT_DIR,
     apply_config_to_args,
     apply_low_memory_tuning,
+    collect_explicit_cli_dests,
     load_config_file,
 )
 from register_app.registration import run_with_fallback
@@ -81,6 +82,34 @@ from register_app.runtime import (
 logger = logging.getLogger("openai_register")
 
 builtins.yasal_bypass_ip_choice = True
+
+SUPPORTED_MAIL_PROVIDERS = ("cfmail", "tempmaillol", "mailtm", "tempmailio", "dropmail")
+
+
+def _parse_mail_providers(raw_value: object, fallback_single: str) -> list[str]:
+    items: list[str] = []
+    if isinstance(raw_value, (list, tuple, set)):
+        candidates = raw_value
+    else:
+        text = str(raw_value or "").strip()
+        candidates = text.split(",") if text else []
+
+    for item in candidates:
+        value = str(item or "").strip().lower()
+        if not value:
+            continue
+        if value not in SUPPORTED_MAIL_PROVIDERS:
+            raise ValueError(f"不支持的邮箱服务: {value}")
+        if value not in items:
+            items.append(value)
+
+    fallback = str(fallback_single or "").strip().lower()
+    if not items and fallback:
+        if fallback not in SUPPORTED_MAIL_PROVIDERS:
+            raise ValueError(f"不支持的邮箱服务: {fallback}")
+        items.append(fallback)
+
+    return items or ["cfmail"]
 
 
 def _resolve_cfmail_process_profiles(selected_profile: str) -> list[str]:
@@ -297,8 +326,13 @@ def main() -> None:
     parser.add_argument(
         "--mail-provider",
         default="cfmail",
-        choices=["cfmail", "tempmaillol", "mailtm", "tempmailio", "dropmail"],
+        choices=list(SUPPORTED_MAIL_PROVIDERS),
         help="邮箱服务（cfmail / tempmaillol / mailtm / tempmailio / dropmail）",
+    )
+    parser.add_argument(
+        "--mail-providers",
+        default="",
+        help="多个邮箱服务并行注册，逗号分隔；如 cfmail,tempmaillol,mailtm",
     )
     parser.add_argument(
         "--cfmail-profile",
@@ -450,12 +484,15 @@ def main() -> None:
     for action in parser._actions:
         if hasattr(action, "dest") and action.dest != "help":
             setattr(args, f"_default_{action.dest}", action.default)
+    explicit_cli_dests = collect_explicit_cli_dests(parser)
 
     # 加载配置文件（命令行参数优先于配置文件）
     config = load_config_file(args.config)
     if config:
         logger.info(f"[信息] 已加载配置文件: {args.config}")
-        apply_config_to_args(args, config)
+        apply_config_to_args(args, config, explicit_cli_dests=explicit_cli_dests)
+    if "once" in explicit_cli_dests and "monitor" not in explicit_cli_dests and "monitor_once" not in explicit_cli_dests:
+        args.register_only = True
 
     sleep_min = max(1, args.sleep_min)
     sleep_max = max(sleep_min, args.sleep_max)
@@ -476,6 +513,14 @@ def main() -> None:
     args.browser_core_version = str(args.browser_core_version or DEFAULT_BROWSER_CORE_VERSION).strip() or DEFAULT_BROWSER_CORE_VERSION
     args.browser_os = str(args.browser_os or DEFAULT_BROWSER_OS).strip() or DEFAULT_BROWSER_OS
     args.roxy_token = str(args.roxy_token or DEFAULT_ROXY_TOKEN).strip()
+    try:
+        args.mail_providers = _parse_mail_providers(
+            getattr(args, "mail_providers", ""),
+            args.mail_provider,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.mail_provider = args.mail_providers[0]
     apply_low_memory_tuning(args)
     args.cfmail_profile = str(args.cfmail_profile or "auto").strip() or "auto"
     args.cfmail_profile_name = (
@@ -542,10 +587,12 @@ def main() -> None:
     )
 
     inspection_mode = bool(args.doctor or args.status)
+    selected_mail_providers = list(getattr(args, "mail_providers", []) or [args.mail_provider])
+    selected_mail_provider_text = ",".join(selected_mail_providers)
 
     if (
         not inspection_mode
-        and args.mail_provider == "cfmail"
+        and "cfmail" in selected_mail_providers
         and not get_cfmail_accounts()
     ):
         parser.error(
@@ -554,8 +601,7 @@ def main() -> None:
 
     if (
         not inspection_mode
-        and
-        args.mail_provider == "cfmail"
+        and "cfmail" in selected_mail_providers
         and args.cfmail_profile.lower() != "auto"
         and not _select_cfmail_account(args.cfmail_profile)
     ):
@@ -620,13 +666,13 @@ def main() -> None:
             args.monitor_once = True
 
         cfmail_desc = ""
-        if args.mail_provider == "cfmail":
+        if "cfmail" in selected_mail_providers:
             cfmail_desc = (
                 f"，cfmail配置文件={args.cfmail_config}，cfmail配置={_cfmail_account_names()}，"
                 f"选择={args.cfmail_profile}"
             )
         log_info(
-            f"巡检模式启动：A目录={args.active_token_dir}，A阈值={args.active_min_count}，巡检间隔={args.monitor_interval}秒，注册并发={args.register_openai_concurrency}，批次={args.register_batch_size}，错峰={args.register_start_delay_seconds:.1f}秒，钉钉汇总间隔={args.dingtalk_summary_interval}秒，注册引擎={args.registration_engine}{cfmail_desc}"
+            f"巡检模式启动：A目录={args.active_token_dir}，A阈值={args.active_min_count}，巡检间隔={args.monitor_interval}秒，注册并发={args.register_openai_concurrency}，批次={args.register_batch_size}，错峰={args.register_start_delay_seconds:.1f}秒，钉钉汇总间隔={args.dingtalk_summary_interval}秒，注册引擎={args.registration_engine}，邮箱服务={selected_mail_provider_text}{cfmail_desc}"
         )
         run_monitor_loop(
             args,
@@ -639,9 +685,9 @@ def main() -> None:
         builtins.yasal_bypass_ip_choice = True
 
     startup_message = (
-        f"[信息] 脚本启动：注册并发上限={args.register_openai_concurrency}，错峰={args.register_start_delay_seconds:.1f}秒，邮箱服务={args.mail_provider}，注册引擎={args.registration_engine}，Token目录={args.token_dir}"
+        f"[信息] 脚本启动：注册并发上限={args.register_openai_concurrency}，错峰={args.register_start_delay_seconds:.1f}秒，邮箱服务={selected_mail_provider_text}，注册引擎={args.registration_engine}，Token目录={args.token_dir}"
     )
-    if args.mail_provider == "cfmail":
+    if "cfmail" in selected_mail_providers:
         startup_message += (
             f"，cfmail配置文件={args.cfmail_config}，cfmail配置={_cfmail_account_names()}，"
             f"选择={args.cfmail_profile}"
@@ -649,7 +695,8 @@ def main() -> None:
     logger.info(startup_message)
 
     if (
-        args.mail_provider == "cfmail"
+        len(selected_mail_providers) == 1
+        and selected_mail_providers[0] == "cfmail"
         and args.cfmail_profile.lower() == "auto"
         and _run_cfmail_profile_processes(
             args,
@@ -659,8 +706,15 @@ def main() -> None:
     ):
         return
 
-    worker_count = 1 if args.mail_provider == "cfmail" else min(3, args.register_openai_concurrency)
-    providers_list = [args.mail_provider for _ in range(worker_count)]
+    worker_count = (
+        1
+        if len(selected_mail_providers) == 1 and selected_mail_providers[0] == "cfmail"
+        else max(min(3, args.register_openai_concurrency), len(selected_mail_providers))
+    )
+    providers_list = [
+        selected_mail_providers[index % len(selected_mail_providers)]
+        for index in range(worker_count)
+    ]
     threads = []
 
     for i in range(1, worker_count + 1):

@@ -41,6 +41,16 @@ class DoctorReport:
         return sum(1 for item in self.checks if item.status == "warn")
 
 
+def _configured_mail_providers(args: Any) -> list[str]:
+    value = getattr(args, "mail_providers", None)
+    if isinstance(value, (list, tuple, set)):
+        items = [str(item or "").strip().lower() for item in value if str(item or "").strip()]
+        if items:
+            return items
+    provider = str(getattr(args, "mail_provider", "") or "").strip().lower()
+    return [provider] if provider else []
+
+
 def _browser_runtime_from_args(args: Any) -> BrowserRuntimeConfig:
     return BrowserRuntimeConfig(
         registration_engine=getattr(args, "registration_engine", "http"),
@@ -177,8 +187,13 @@ def _check_proxy(proxy: str | None) -> DoctorCheck:
 
 
 def _check_cfmail(args: Any) -> DoctorCheck:
-    if str(args.mail_provider or "").strip().lower() != "cfmail":
-        return DoctorCheck("cfmail", "skip", f"当前邮箱服务为 {args.mail_provider}，跳过 cfmail 检查")
+    selected_providers = _configured_mail_providers(args)
+    if "cfmail" not in selected_providers:
+        return DoctorCheck(
+            "cfmail",
+            "skip",
+            f"当前邮箱服务为 {','.join(selected_providers) or args.mail_provider}，跳过 cfmail 检查",
+        )
 
     accounts = get_cfmail_accounts()
     if not accounts:
@@ -344,6 +359,7 @@ def collect_doctor_report(args: Any) -> DoctorReport:
 def build_status_snapshot(args: Any) -> dict[str, Any]:
     browser_runtime = _browser_runtime_from_args(args)
     patchright_ok, patchright_detail = _is_patchright_importable()
+    selected_providers = _configured_mail_providers(args)
     active_count = count_json_files(args.active_token_dir)
     active_shortage = max(int(args.active_min_count) - active_count, 0)
     snapshot: dict[str, Any] = {
@@ -351,6 +367,7 @@ def build_status_snapshot(args: Any) -> dict[str, Any]:
         "config_path": str(args.config or "").strip(),
         "proxy": str(args.proxy or "").strip(),
         "mail_provider": str(args.mail_provider or "").strip(),
+        "mail_providers": selected_providers,
         "active": {
             "dir": str(args.active_token_dir or "").strip(),
             "count": active_count,
@@ -384,7 +401,7 @@ def build_status_snapshot(args: Any) -> dict[str, Any]:
         },
     }
 
-    if str(args.mail_provider or "").strip().lower() == "cfmail":
+    if "cfmail" in selected_providers:
         accounts = get_cfmail_accounts()
         selected = select_cfmail_account(args.cfmail_profile)
         snapshot["cfmail"] = {
@@ -433,7 +450,9 @@ def print_status_snapshot(snapshot: dict[str, Any], *, output_json: bool = False
     print(f"时间：{snapshot.get('checked_at', '')}")
     print(f"配置：{snapshot.get('config_path', '') or '(默认/未指定)'}")
     print(f"代理：{snapshot.get('proxy', '') or '(未显式设置)'}")
-    print(f"邮箱服务：{snapshot.get('mail_provider', '')}")
+    providers = snapshot.get("mail_providers") or []
+    provider_text = ",".join(str(item or "") for item in providers) if providers else snapshot.get("mail_provider", "")
+    print(f"邮箱服务：{provider_text}")
 
     active = snapshot.get("active") or {}
     output = snapshot.get("output") or {}

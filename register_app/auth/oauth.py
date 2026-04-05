@@ -796,24 +796,40 @@ def follow_oauth_redirect_chain(
     try:
         for _ in range(max_hops):
             if "code=" in current_url and "state=" in current_url:
-                return submit_callback_url(
-                    callback_url=current_url,
-                    code_verifier=oauth.code_verifier,
-                    redirect_uri=oauth.redirect_uri,
-                    expected_state=oauth.state,
-                )
+                parsed_current = urllib.parse.urlparse(current_url)
+                if parsed_current.hostname in ("localhost", "127.0.0.1"):
+                    return submit_callback_url(
+                        callback_url=current_url,
+                        code_verifier=oauth.code_verifier,
+                        redirect_uri=oauth.redirect_uri,
+                        expected_state=oauth.state,
+                    )
+                if parsed_current.hostname in ("chatgpt.com", "www.chatgpt.com"):
+                    logger.info(
+                        f"[线程 {thread_id}] [信息] OAuth 跳转链命中 ChatGPT Web callback，先消费 Web callback 再交给上层提 token"
+                    )
+                    session.get(current_url, allow_redirects=True, timeout=15)
+                    return None
 
             resp = session.get(current_url, allow_redirects=False, timeout=15)
             next_url = extract_continue_url_from_response(resp)
             if not next_url:
                 break
             if "code=" in next_url and "state=" in next_url:
-                return submit_callback_url(
-                    callback_url=next_url,
-                    code_verifier=oauth.code_verifier,
-                    redirect_uri=oauth.redirect_uri,
-                    expected_state=oauth.state,
-                )
+                parsed_next = urllib.parse.urlparse(next_url)
+                if parsed_next.hostname in ("localhost", "127.0.0.1"):
+                    return submit_callback_url(
+                        callback_url=next_url,
+                        code_verifier=oauth.code_verifier,
+                        redirect_uri=oauth.redirect_uri,
+                        expected_state=oauth.state,
+                    )
+                if parsed_next.hostname in ("chatgpt.com", "www.chatgpt.com"):
+                    logger.info(
+                        f"[线程 {thread_id}] [信息] OAuth 跳转链命中 ChatGPT Web callback，先消费 Web callback 再交给上层提 token"
+                    )
+                    session.get(next_url, allow_redirects=True, timeout=15)
+                    return None
             if next_url == current_url:
                 break
             current_url = next_url

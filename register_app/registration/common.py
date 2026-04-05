@@ -20,7 +20,7 @@ from ..config import (
 )
 from ..mail.diagnostics import get_mailbox_wait_diagnostics
 from ..mail.providers import TempMailbox
-from ..sentinel import request_sentinel_header
+from ..sentinel import request_sentinel_header, request_sentinel_tokens
 
 logger = logging.getLogger("openai_register")
 
@@ -134,13 +134,15 @@ def _post_create_account_with_retry(
 
     for attempt in range(1, attempts + 1):
         try:
-            create_account_sentinel = request_sentinel_header(
+            sentinel_tokens = request_sentinel_tokens(
                 did=did,
                 proxies=proxies,
                 impersonate=impersonate,
                 thread_id=thread_id,
                 flow="oauth_create_account",
             )
+            create_account_sentinel = str(sentinel_tokens.get("header") or "").strip()
+            create_account_so_token = str(sentinel_tokens.get("so_token") or "").strip()
             if not create_account_sentinel:
                 return None
 
@@ -151,6 +153,11 @@ def _post_create_account_with_retry(
                     "accept": "application/json",
                     "content-type": "application/json",
                     "openai-sentinel-token": create_account_sentinel,
+                    **(
+                        {"openai-sentinel-so-token": create_account_so_token}
+                        if create_account_so_token
+                        else {}
+                    ),
                 },
                 data=create_account_body,
             )
@@ -183,6 +190,94 @@ def _post_create_account_with_retry(
         return last_resp
 
     return last_resp
+
+
+def _post_user_register_with_fallback(
+    session: Any,
+    *,
+    username: str,
+    password: str,
+    did: str,
+    proxies: Any,
+    impersonate: str,
+    thread_id: int,
+) -> Tuple[Optional[Any], Dict[str, Any]]:
+    """提交密码注册请求。
+
+    当前 auth 前端 bundle 显示 create-account/password 页会优先携带
+    `username_password_create` 的 Sentinel header 请求 `/user/register`。
+    但在真实环境里，直接不带该 header 的兼容请求有时反而更稳定。
+
+    因此这里采用：
+    1. 先走当前兼容链（不带 Sentinel）
+    2. 若失败，再尝试一次更贴近前端的 Sentinel 版本
+    3. 若 Sentinel fallback 仍失败，则保留首个失败响应，避免误伤现有链路
+    """
+    register_body = json.dumps(
+        {"password": str(password or "").strip(), "username": str(username or "").strip()},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    base_headers = {
+        "referer": "https://auth.openai.com/create-account/password",
+        "accept": "application/json",
+        "content-type": "application/json",
+    }
+    metadata: Dict[str, Any] = {
+        "password_register_mode": "plain",
+        "password_register_fallback_attempted": False,
+        "password_register_fallback_succeeded": False,
+    }
+
+    primary_resp = session.post(
+        "https://auth.openai.com/api/accounts/user/register",
+        headers=base_headers,
+        data=register_body,
+    )
+    metadata["password_register_plain_status"] = getattr(primary_resp, "status_code", 0)
+    if getattr(primary_resp, "status_code", 0) == 200:
+        return primary_resp, metadata
+
+    metadata["password_register_fallback_attempted"] = True
+    sentinel_header = ""
+    sentinel_exc = ""
+    try:
+        sentinel_header = request_sentinel_header(
+            did=did,
+            proxies=proxies,
+            impersonate=impersonate,
+            thread_id=thread_id,
+            flow="username_password_create",
+        )
+    except Exception as exc:
+        sentinel_exc = str(exc)
+
+    if sentinel_exc:
+        metadata["password_register_fallback_error"] = sentinel_exc
+    if not sentinel_header:
+        metadata["password_register_fallback_reason"] = "sentinel_unavailable"
+        return primary_resp, metadata
+
+    metadata["password_register_fallback_reason"] = "try_browser_like_sentinel"
+    sentinel_resp = session.post(
+        "https://auth.openai.com/api/accounts/user/register",
+        headers={
+            **base_headers,
+            "openai-sentinel-token": sentinel_header,
+        },
+        data=register_body,
+    )
+    metadata["password_register_fallback_status"] = getattr(sentinel_resp, "status_code", 0)
+    if getattr(sentinel_resp, "status_code", 0) == 200:
+        metadata["password_register_mode"] = "sentinel"
+        metadata["password_register_fallback_succeeded"] = True
+        return sentinel_resp, metadata
+
+    metadata["password_register_fallback_preview"] = _preview_response_text(
+        sentinel_resp,
+        limit=240,
+    )
+    return primary_resp, metadata
 
 
 def _response_json_object(resp: Any) -> Dict[str, Any]:

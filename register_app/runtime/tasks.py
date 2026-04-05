@@ -26,6 +26,21 @@ from .common import (
 )
 
 
+def _normalize_provider_list(provider_keys: Any) -> list[str]:
+    if isinstance(provider_keys, str):
+        value = str(provider_keys or "").strip()
+        return [value] if value else []
+    if isinstance(provider_keys, (list, tuple, set)):
+        normalized = []
+        for item in provider_keys:
+            value = str(item or "").strip()
+            if value:
+                normalized.append(value)
+        return normalized
+    value = str(provider_keys or "").strip()
+    return [value] if value else []
+
+
 def register_single_account(
     proxy: Optional[str],
     provider_key: str,
@@ -60,7 +75,7 @@ def register_single_account(
 def register_accounts(
     target_count: int,
     proxy: Optional[str],
-    provider_key: str,
+    provider_keys: Any,
     mailtm_base: str,
     token_dir: str,
     batch_size: int,
@@ -73,6 +88,14 @@ def register_accounts(
 ) -> int:
     if target_count <= 0:
         return 0
+
+    normalized_providers = _normalize_provider_list(provider_keys)
+    if not normalized_providers:
+        normalized_providers = [""]
+    if len(normalized_providers) > 1:
+        min_parallelism = min(len(normalized_providers), max(1, target_count))
+        batch_size = max(batch_size, min_parallelism)
+        register_openai_concurrency = max(register_openai_concurrency, min_parallelism)
 
     if auto_continue_non_us and getattr(builtins, "yasal_bypass_ip_choice", None) is None:
         builtins.yasal_bypass_ip_choice = True
@@ -97,12 +120,13 @@ def register_accounts(
 
         for index in range(current_batch_size):
             current_thread_id = attempts + index + 1
+            current_provider = normalized_providers[(attempts + index) % len(normalized_providers)]
 
-            def _task(tid: int = current_thread_id) -> None:
+            def _task(tid: int = current_thread_id, provider: str = current_provider) -> None:
                 nonlocal batch_success_count
                 is_success = register_single_account(
                     proxy,
-                    provider_key,
+                    provider,
                     tid,
                     mailtm_base,
                     token_dir,
@@ -161,7 +185,7 @@ def run_monitor_cycle(args: Any, register_runner: RegisterRunner) -> MonitorCycl
         replenished_to_active = register_accounts(
             active_shortage,
             args.proxy,
-            args.mail_provider,
+            getattr(args, "mail_providers", None) or args.mail_provider,
             args.mailtm_api_base,
             args.active_token_dir,
             args.register_batch_size,
@@ -283,7 +307,10 @@ def run_monitor_loop(
     pending_results: list[MonitorCycleResult] = []
     summary_started_at = time.time()
     while True:
-        if args.mail_provider == "cfmail" and reload_cfmail_accounts:
+        selected_providers = _normalize_provider_list(
+            getattr(args, "mail_providers", None) or args.mail_provider
+        )
+        if "cfmail" in selected_providers and reload_cfmail_accounts:
             reload_cfmail_accounts()
         cycle_started_at = time.time()
         try:

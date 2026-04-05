@@ -18,20 +18,36 @@ from datetime import datetime
 from typing import Any, List, Sequence
 
 from curl_cffi import requests
+from .sentinel_sidecar import (
+    generate_sentinel_requirements_token_via_sidecar,
+    run_sentinel_vm_sidecar,
+)
 
 logger = logging.getLogger("openai_register")
 
 # ---------------------------------------------------------------------------
 # Sentinel 常量
 # ---------------------------------------------------------------------------
+SENTINEL_VERSION = "20260219f9f6"
 SENTINEL_FRAME_URL = (
-    "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6"
+    f"https://sentinel.openai.com/backend-api/sentinel/frame.html?sv={SENTINEL_VERSION}"
 )
-SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js"
+SENTINEL_SDK_URL = f"https://sentinel.openai.com/sentinel/{SENTINEL_VERSION}/sdk.js"
+SENTINEL_CHATGPT_FRAME_URL = (
+    f"https://chatgpt.com/backend-api/sentinel/frame.html?sv={SENTINEL_VERSION}"
+)
+SENTINEL_CHATGPT_SDK_URL = f"https://chatgpt.com/sentinel/{SENTINEL_VERSION}/sdk.js"
 SENTINEL_DOCUMENT_KEYS = ("visibilityState", "readyState", "documentURI", "location")
 SENTINEL_WINDOW_KEYS = ("location", "document", "navigator", "origin", "window")
-SENTINEL_SCRIPT_SOURCES = (SENTINEL_SDK_URL, SENTINEL_FRAME_URL)
+SENTINEL_SCRIPT_SOURCES = (
+    SENTINEL_SDK_URL,
+    SENTINEL_FRAME_URL,
+    SENTINEL_CHATGPT_SDK_URL,
+    SENTINEL_CHATGPT_FRAME_URL,
+)
 SENTINEL_POW_PREFIX = "gAAAAAB"
+SENTINEL_REQUIREMENTS_PREFIX = "gAAAAAC"
+SENTINEL_REQUIREMENTS_ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
 SENTINEL_POW_SUFFIX = "~S"
 SENTINEL_POW_MAX_ATTEMPTS = 500000
 SENTINEL_POW_TIMEOUT_SECONDS = 20
@@ -126,6 +142,11 @@ def random_impersonate() -> str:
 def random_user_agent() -> str:
     """从 UA 池中随机选取一个 User-Agent 字符串。"""
     return random.choice(CHROME_UA_POOL)
+
+
+def build_sentinel_requirements_token() -> str:
+    """构造更接近官方 SDK 的 requirements token。"""
+    return _generate_sentinel_requirements_token()
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +267,79 @@ def _build_sentinel_pow_fingerprint() -> List[Any]:
     ]
 
 
+def _build_sentinel_requirements_fingerprint(requirements_seed: str) -> List[Any]:
+    """构建更贴近官方 SDK `initializeAndGatherData()` 的 requirements 指纹。"""
+    language_pair = random.choice(LANGUAGE_POOL)
+    lang, langs = language_pair
+    hw_concurrency = random.choice(HARDWARE_CONCURRENCY_POOL)
+    screen_sum = random.choice(SCREEN_SUM_POOL)
+    heap_limit = random.choice(JS_HEAP_SIZE_POOL)
+    ua = random_user_agent()
+    nav_key = _sentinel_random_choice(
+        ("userAgent", "language", "languages", "hardwareConcurrency", "platform"),
+        "userAgent",
+    )
+    navigator_values = {
+        "userAgent": ua,
+        "language": lang,
+        "languages": langs,
+        "hardwareConcurrency": str(hw_concurrency),
+        "platform": _sentinel_random_choice(("Win32", "MacIntel", "Linux x86_64"), "Win32"),
+    }
+    perf_now_ms = time.perf_counter() * 1000
+    time_origin_ms = int(time.time() * 1000 - perf_now_ms)
+    build_marker = _sentinel_random_choice(
+        ("prod-sidecar", "prod-chatgpt", "prod-auth"),
+        "prod-sidecar",
+    )
+    query_keys = "callbackUrl,screen_hint"
+    return [
+        screen_sum,
+        _sentinel_js_now_string(),
+        heap_limit,
+        random.random(),
+        ua,
+        _sentinel_random_choice(SENTINEL_SCRIPT_SOURCES, SENTINEL_SDK_URL),
+        build_marker,
+        lang,
+        langs,
+        round((time.perf_counter() - (perf_now_ms / 1000)) * 1000),
+        f"{nav_key}{SENTINEL_MINUS_SIGN}{navigator_values.get(nav_key, ua)}",
+        _sentinel_random_choice(("visibilityState", "readyState", "documentURI", "location"), "location"),
+        _sentinel_random_choice(("location", "document", "navigator", "origin", "window"), "location"),
+        perf_now_ms,
+        str(uuid.uuid4()),
+        query_keys,
+        hw_concurrency,
+        time_origin_ms,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
+
+
+def _generate_sentinel_requirements_token() -> str:
+    """生成 requirements token。"""
+    requirements_seed = str(random.random())
+    started_at = time.perf_counter()
+    candidate = _build_sentinel_requirements_fingerprint(requirements_seed)
+    for attempt in range(SENTINEL_POW_MAX_ATTEMPTS):
+        candidate[3] = attempt
+        candidate[9] = round((time.perf_counter() - started_at) * 1000)
+        encoded = _sentinel_b64_json(candidate)
+        if _sentinel_hash_hex(requirements_seed + encoded)[:1] <= "0":
+            return f"{SENTINEL_REQUIREMENTS_PREFIX}{encoded}{SENTINEL_POW_SUFFIX}"
+    return (
+        SENTINEL_REQUIREMENTS_PREFIX
+        + SENTINEL_REQUIREMENTS_ERROR_PREFIX
+        + _sentinel_b64_json("e")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sentinel POW 求解
 # ---------------------------------------------------------------------------
@@ -330,37 +424,81 @@ def request_sentinel_header(
 
     flow_name = str(flow or "authorize_continue").strip() or "authorize_continue"
 
+    tokens = request_sentinel_tokens(
+        did=device_id,
+        proxies=proxies,
+        impersonate=impersonate,
+        thread_id=thread_id,
+        flow=flow_name,
+    )
+    return str(tokens.get("header") or "").strip()
+
+
+def request_sentinel_tokens(
+    *,
+    did: str,
+    proxies: Any,
+    impersonate: str,
+    thread_id: int,
+    flow: str = "authorize_continue",
+) -> dict:
+    """请求 Sentinel token 相关产物。
+
+    返回：
+    - header: `OpenAI-Sentinel-Token` JSON 字符串
+    - so_token: `OpenAI-Sentinel-SO-Token` JSON 字符串（若可得）
+    - payload / proof / requirements_token / sidecar: 调试辅助字段
+    """
+    device_id = str(did or "").strip()
+    if not device_id:
+        logger.error(f"[线程 {thread_id}] [错误] 无法获取 Device ID，Sentinel 请求已跳过")
+        return {}
+
+    flow_name = str(flow or "authorize_continue").strip() or "authorize_continue"
+    requirements_token = (
+        generate_sentinel_requirements_token_via_sidecar(
+            did=device_id,
+            flow=flow_name,
+            user_agent=random_user_agent(),
+            script_sources=SENTINEL_SCRIPT_SOURCES,
+        )
+        or build_sentinel_requirements_token()
+    )
     body = json.dumps(
-        {"p": "", "id": device_id, "flow": flow_name},
+        {"p": requirements_token, "id": device_id, "flow": flow_name},
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    resp = requests.post(
-        "https://sentinel.openai.com/backend-api/sentinel/req",
-        headers={
-            "origin": "https://sentinel.openai.com",
-            "referer": SENTINEL_FRAME_URL,
-            "content-type": "text/plain;charset=UTF-8",
-        },
-        data=body,
+    sentinel_payload = request_sentinel_payload(
+        did=device_id,
         proxies=proxies,
         impersonate=impersonate,
-        timeout=15,
+        thread_id=thread_id,
+        flow=flow_name,
+        request_body=body,
     )
-    if resp.status_code != 200:
-        logger.error(f"[线程 {thread_id}] [错误] Sentinel 请求失败，状态码: {resp.status_code}")
-        return ""
-
-    try:
-        sentinel_payload = resp.json() if resp.content else {}
-    except Exception as exc:
-        logger.error(f"[线程 {thread_id}] [错误] Sentinel 响应解析失败: {exc}")
-        return ""
+    if not sentinel_payload:
+        fallback_body = json.dumps(
+            {"p": "", "id": device_id, "flow": flow_name},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        sentinel_payload = request_sentinel_payload(
+            did=device_id,
+            proxies=proxies,
+            impersonate=impersonate,
+            thread_id=thread_id,
+            flow=flow_name,
+            request_body=fallback_body,
+        )
+        if not sentinel_payload:
+            return {}
+        requirements_token = ""
 
     token = str((sentinel_payload or {}).get("token") or "").strip()
     if not token:
         logger.error(f"[线程 {thread_id}] [错误] Sentinel 响应里缺少 token")
-        return ""
+        return {}
 
     proof = ""
     pow_config = (
@@ -371,7 +509,7 @@ def request_sentinel_header(
     if isinstance(pow_config, dict) and pow_config.get("required"):
         difficulty = str(pow_config.get("difficulty") or "").strip().lower()
         logger.info(
-            f"[线程 {thread_id}] [信息] Sentinel 要求 POW，开始求解，难度={difficulty or 'unknown'}"
+            f"[线程 {thread_id}] [信息] Sentinel 要求 POW，开始求解，来源={sentinel_payload.get('_sentinel_source') or 'unknown'}，难度={difficulty or 'unknown'}"
         )
         proof = solve_sentinel_pow(
             seed=str(pow_config.get("seed") or ""),
@@ -379,12 +517,37 @@ def request_sentinel_header(
             thread_id=thread_id,
         )
         if not proof:
-            return ""
+            return {}
 
-    return json.dumps(
+    sidecar_result = run_sentinel_vm_sidecar(
+        payload=sentinel_payload,
+        did=device_id,
+        flow=flow_name,
+        requirements_token=requirements_token,
+        proof=proof,
+        user_agent=random_user_agent(),
+        script_sources=SENTINEL_SCRIPT_SOURCES,
+    )
+    turnstile_value = str((sidecar_result or {}).get("turnstile_t") or "").strip()
+    so_token = str((sidecar_result or {}).get("openai_sentinel_so_token") or "").strip()
+    if turnstile_value:
+        logger.info(
+            f"[线程 {thread_id}] [信息] Sentinel sidecar 已生成 turnstile t，flow={flow_name}，len={len(turnstile_value)}"
+        )
+    elif sidecar_result and sidecar_result.get("turnstile_error"):
+        logger.warning(
+            f"[线程 {thread_id}] [警告] Sentinel sidecar 计算 t 失败，flow={flow_name}: "
+            f"{str(sidecar_result.get('turnstile_error') or '')[:240]}"
+        )
+    if so_token:
+        logger.info(
+            f"[线程 {thread_id}] [信息] Sentinel sidecar 已生成 SO-Token，flow={flow_name}"
+        )
+
+    header = json.dumps(
         {
             "p": proof,
-            "t": "",
+            "t": turnstile_value,
             "c": token,
             "id": device_id,
             "flow": flow_name,
@@ -392,3 +555,123 @@ def request_sentinel_header(
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    return {
+        "header": header,
+        "so_token": so_token,
+        "payload": sentinel_payload,
+        "proof": proof,
+        "requirements_token": requirements_token,
+        "sidecar": sidecar_result or {},
+    }
+
+
+def request_sentinel_payload(
+    *,
+    did: str,
+    proxies: Any,
+    impersonate: str,
+    thread_id: int,
+    flow: str = "authorize_continue",
+    request_body: str = "",
+) -> dict:
+    """请求 Sentinel 原始 payload。
+
+    用于后续继续逆向 turnstile.dx / so.collector_dx / so.snapshot_dx。
+    成功返回 dict，失败返回空 dict。
+    """
+    device_id = str(did or "").strip()
+    if not device_id:
+        logger.error(f"[线程 {thread_id}] [错误] 无法获取 Device ID，Sentinel 请求已跳过")
+        return {}
+
+    flow_name = str(flow or "authorize_continue").strip() or "authorize_continue"
+    body = str(request_body or "").strip()
+    if not body:
+        body = json.dumps(
+            {"p": "", "id": device_id, "flow": flow_name},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    candidates = (
+        (
+            "sentinel.openai.com",
+            "https://sentinel.openai.com/backend-api/sentinel/req",
+            "https://sentinel.openai.com",
+            SENTINEL_FRAME_URL,
+        ),
+        (
+            "chatgpt.com",
+            "https://chatgpt.com/backend-api/sentinel/req",
+            "https://chatgpt.com",
+            SENTINEL_CHATGPT_FRAME_URL,
+        ),
+    )
+    last_error = ""
+
+    for candidate_name, candidate_url, candidate_origin, candidate_referer in candidates:
+        try:
+            resp = requests.post(
+                candidate_url,
+                headers={
+                    "origin": candidate_origin,
+                    "referer": candidate_referer,
+                    "content-type": "text/plain;charset=UTF-8",
+                    "cookie": f"oai-did={urllib.parse.quote(device_id)}",
+                },
+                data=body,
+                proxies=proxies,
+                impersonate=impersonate,
+                timeout=15,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning(
+                f"[线程 {thread_id}] [警告] Sentinel 请求异常（{candidate_name}）: {exc}"
+            )
+            continue
+
+        if resp.status_code != 200:
+            last_error = f"status={resp.status_code}"
+            logger.warning(
+                f"[线程 {thread_id}] [警告] Sentinel 请求失败（{candidate_name}），状态码: {resp.status_code}"
+            )
+            continue
+
+        try:
+            sentinel_payload = resp.json() if resp.content else {}
+        except Exception as exc:
+            last_error = f"json_error={exc}"
+            logger.warning(
+                f"[线程 {thread_id}] [警告] Sentinel 响应解析失败（{candidate_name}）: {exc}"
+            )
+            continue
+
+        token = str((sentinel_payload or {}).get("token") or "").strip()
+        if not token:
+            last_error = "missing_token"
+            logger.warning(
+                f"[线程 {thread_id}] [警告] Sentinel 响应里缺少 token（{candidate_name}）"
+            )
+            continue
+
+        if isinstance(sentinel_payload, dict):
+            sentinel_payload["_sentinel_source"] = candidate_name
+            turnstile_required = bool(
+                isinstance(sentinel_payload.get("turnstile"), dict)
+                and sentinel_payload.get("turnstile", {}).get("required")
+            )
+            session_observer_required = bool(
+                isinstance(sentinel_payload.get("so"), dict)
+                and sentinel_payload.get("so", {}).get("required")
+            )
+            logger.info(
+                f"[线程 {thread_id}] [信息] Sentinel payload 已获取，来源={candidate_name}，"
+                f"turnstile_required={turnstile_required}，so_required={session_observer_required}"
+            )
+            return sentinel_payload
+
+    logger.error(
+        f"[线程 {thread_id}] [错误] Sentinel 请求全部失败，flow={flow_name}，last_error={last_error or 'unknown'}"
+    )
+    return {}

@@ -22,6 +22,7 @@
 
   "_section_register": "===== 注册配置（默认放慢） =====",
   "mail_provider": "cfmail",
+  "mail_providers": [],
   "register_batch_size": 1,
   "register_openai_concurrency": 1,
   "register_start_delay_seconds": 8.0,

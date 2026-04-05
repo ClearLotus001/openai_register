@@ -49,6 +49,7 @@ from .common import (
     _mailbox_public_metadata,
     _mailbox_wait_failure_reason,
     _post_create_account_with_retry,
+    _post_user_register_with_fallback,
     _preview_response_text,
     _response_json_object,
 )
@@ -384,21 +385,17 @@ def _run_http(
             logger.info(f"[线程 {thread_id}] [信息] 当前邮箱疑似已存在账号，跳过密码注册与验证码发送，直接进入邮箱验证码校验")
         else:
             existing_signup_message_ids = get_mailbox_message_snapshot(mailbox, thread_id, proxies)
-            register_body = json.dumps(
-                {"password": password, "username": email},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
             _set_stage("password_register")
-            register_resp = s.post(
-                "https://auth.openai.com/api/accounts/user/register",
-                headers={
-                    "referer": "https://auth.openai.com/create-account/password",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                },
-                data=register_body,
+            register_resp, register_meta = _post_user_register_with_fallback(
+                s,
+                username=email,
+                password=password,
+                did=did,
+                proxies=proxies,
+                impersonate=current_impersonate,
+                thread_id=thread_id,
             )
+            result.metadata.update(register_meta)
             logger.info(f"[线程 {thread_id}] [信息] 密码注册请求已提交，状态码: {register_resp.status_code}")
             if register_resp.status_code != 200:
                 register_error_code, register_error_message = _extract_response_error_code_message(register_resp)
@@ -417,9 +414,21 @@ def _run_http(
                     failure_detail=register_detail,
                 )
 
+            register_payload = _response_json_object(register_resp)
+            register_page = register_payload.get("page") if isinstance(register_payload.get("page"), dict) else {}
+            register_page_type = str((register_page or {}).get("type") or "").strip()
+            register_continue_url = extract_continue_url_from_response(register_resp)
+            result.metadata.update(
+                {
+                    "password_register_page_type": register_page_type,
+                    "password_register_continue_url": register_continue_url,
+                }
+            )
+
             _set_stage("email_otp_send")
+            otp_send_url = register_continue_url or "https://auth.openai.com/api/accounts/email-otp/send"
             otp_resp = s.get(
-                "https://auth.openai.com/api/accounts/email-otp/send",
+                otp_send_url,
                 headers={
                     "referer": "https://auth.openai.com/create-account/password",
                     "accept": "application/json",
@@ -484,6 +493,22 @@ def _run_http(
                 status_code=getattr(code_resp, "status_code", "unknown"),
             )
 
+        code_payload = _response_json_object(code_resp)
+        code_page = code_payload.get("page") if isinstance(code_payload.get("page"), dict) else {}
+        code_page_type = str((code_page or {}).get("type") or "").strip()
+        code_continue_url = extract_continue_url_from_response(code_resp)
+        code_gate = ""
+        if "add-phone" in str(code_continue_url or "").lower() or "add_phone" in code_page_type.lower():
+            code_gate = "add_phone"
+        result.metadata.update(
+            {
+                "email_otp_validate_page_type": code_page_type,
+                "email_otp_validate_continue_url": code_continue_url,
+                "email_otp_validate_gate": code_gate,
+            }
+        )
+
+        post_otp_continue_url = code_continue_url if is_existing_account else ""
         post_create_continue_url = ""
         post_create_gate = ""
         if not is_existing_account:
@@ -564,9 +589,27 @@ def _run_http(
 
         if post_create_continue_url:
             _set_stage("token_continue_url")
-            token_json = try_token_via_continue_url(s, oauth, post_create_continue_url, thread_id)
+            token_json = try_token_via_continue_url(
+                s,
+                oauth,
+                post_create_continue_url,
+                thread_id,
+                proxy_url=proxy or "",
+            )
             if token_json:
                 token_source = "create_account_continue"
+
+        if not token_json and post_otp_continue_url:
+            _set_stage("token_continue_url_after_otp")
+            token_json = try_token_via_continue_url(
+                s,
+                oauth,
+                post_otp_continue_url,
+                thread_id,
+                proxy_url=proxy or "",
+            )
+            if token_json:
+                token_source = "email_otp_continue"
 
         if not token_json:
             _set_stage("token_session_cookie")
@@ -577,10 +620,15 @@ def _run_http(
         if not token_json:
             _set_stage("token_workspace_select")
             auth_cookie = str(s.cookies.get("oai-client-auth-session") or "").strip()
-            if auth_cookie:
-                token_json = try_token_via_workspace_select(s, oauth, auth_cookie, thread_id)
-                if token_json:
-                    token_source = "workspace_select"
+            token_json = try_token_via_workspace_select(
+                s,
+                oauth,
+                auth_cookie,
+                thread_id,
+                proxy_url=proxy or "",
+            )
+            if token_json:
+                token_source = "workspace_select"
 
         if not token_json:
             _set_stage("token_existing_session")
