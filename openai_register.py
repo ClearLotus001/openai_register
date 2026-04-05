@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 
+from register_app.browser import BrowserRuntimeConfig, configure_browser_runtime
 from register_app.doctor import (
     build_status_snapshot,
     collect_doctor_report,
@@ -44,16 +45,26 @@ from register_app.mail.cfmail import (
 )
 from register_app.config import (
     DEFAULT_ACTIVE_TOKEN_DIR,
+    DEFAULT_BROWSER_ASSET_CACHE_ENABLED,
+    DEFAULT_BROWSER_BACKEND,
+    DEFAULT_BROWSER_CORE_VERSION,
+    DEFAULT_BROWSER_KEEP_PROFILE_FOR_OAUTH,
+    DEFAULT_BROWSER_OS,
+    DEFAULT_BROWSER_SCREENSHOTS_ENABLED,
     DEFAULT_CHECK_INTERVAL_SECONDS,
     DEFAULT_CONFIG_PATH,
     DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
     DEFAULT_DINGTALK_SUMMARY_INTERVAL_SECONDS,
     DEFAULT_DINGTALK_WEBHOOK,
     DEFAULT_MIN_ACTIVE_COUNT,
+    DEFAULT_REGISTRATION_ENGINE,
     DEFAULT_REGISTER_BATCH_SIZE,
     DEFAULT_REGISTER_FAILURE_EXTRA_SLEEP_SECONDS,
     DEFAULT_REGISTER_OPENAI_CONCURRENCY,
     DEFAULT_REGISTER_START_DELAY_SECONDS,
+    DEFAULT_ROXY_PORT,
+    DEFAULT_ROXY_TOKEN,
+    DEFAULT_ROXY_WORKSPACE_ID,
     DEFAULT_TOKEN_OUTPUT_DIR,
     apply_config_to_args,
     apply_low_memory_tuning,
@@ -212,6 +223,63 @@ def main() -> None:
     )
     parser.add_argument(
         "--proxy", default=None, help="代理地址，如 http://127.0.0.1:7890"
+    )
+    parser.add_argument(
+        "--registration-engine",
+        default=DEFAULT_REGISTRATION_ENGINE,
+        choices=["http", "browser", "hybrid"],
+        help="注册引擎：http / browser / hybrid（当前 phase 1 默认仍会走 HTTP）",
+    )
+    parser.add_argument(
+        "--browser-backend",
+        default=DEFAULT_BROWSER_BACKEND,
+        choices=["roxy"],
+        help="浏览器后端，当前支持 roxy",
+    )
+    parser.add_argument(
+        "--roxy-port",
+        type=int,
+        default=DEFAULT_ROXY_PORT,
+        help="RoxyBrowser API 端口",
+    )
+    parser.add_argument(
+        "--roxy-token",
+        default=DEFAULT_ROXY_TOKEN,
+        help="RoxyBrowser API token",
+    )
+    parser.add_argument(
+        "--roxy-workspace-id",
+        type=int,
+        default=DEFAULT_ROXY_WORKSPACE_ID,
+        help="RoxyBrowser workspaceId",
+    )
+    parser.add_argument(
+        "--browser-core-version",
+        default=DEFAULT_BROWSER_CORE_VERSION,
+        help="浏览器 profile coreVersion",
+    )
+    parser.add_argument(
+        "--browser-os",
+        default=DEFAULT_BROWSER_OS,
+        help="浏览器 profile 操作系统标识，如 macOS / Windows",
+    )
+    parser.add_argument(
+        "--browser-keep-profile-for-oauth",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_BROWSER_KEEP_PROFILE_FOR_OAUTH,
+        help="浏览器注册成功后是否保留 profile 供 OAuth 复用",
+    )
+    parser.add_argument(
+        "--browser-screenshots-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_BROWSER_SCREENSHOTS_ENABLED,
+        help="是否启用浏览器截图调试输出",
+    )
+    parser.add_argument(
+        "--browser-asset-cache-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_BROWSER_ASSET_CACHE_ENABLED,
+        help="是否启用浏览器静态资源缓存",
     )
     parser.add_argument("--once", action="store_true", help="注册模式只运行一次")
     parser.add_argument(
@@ -401,6 +469,13 @@ def main() -> None:
     args.register_start_delay_seconds = max(0.0, float(args.register_start_delay_seconds))
     args.cfmail_fail_threshold = max(1, args.cfmail_fail_threshold)
     args.cfmail_cooldown_seconds = max(0, args.cfmail_cooldown_seconds)
+    args.roxy_port = max(1, int(args.roxy_port or DEFAULT_ROXY_PORT))
+    args.roxy_workspace_id = max(0, int(args.roxy_workspace_id or 0))
+    args.registration_engine = str(args.registration_engine or DEFAULT_REGISTRATION_ENGINE).strip().lower() or DEFAULT_REGISTRATION_ENGINE
+    args.browser_backend = str(args.browser_backend or DEFAULT_BROWSER_BACKEND).strip().lower() or DEFAULT_BROWSER_BACKEND
+    args.browser_core_version = str(args.browser_core_version or DEFAULT_BROWSER_CORE_VERSION).strip() or DEFAULT_BROWSER_CORE_VERSION
+    args.browser_os = str(args.browser_os or DEFAULT_BROWSER_OS).strip() or DEFAULT_BROWSER_OS
+    args.roxy_token = str(args.roxy_token or DEFAULT_ROXY_TOKEN).strip()
     apply_low_memory_tuning(args)
     args.cfmail_profile = str(args.cfmail_profile or "auto").strip() or "auto"
     args.cfmail_profile_name = (
@@ -450,6 +525,20 @@ def main() -> None:
         hot_reload_enabled=not has_cfmail_override,
         fail_threshold=args.cfmail_fail_threshold,
         cooldown_seconds=args.cfmail_cooldown_seconds,
+    )
+    configure_browser_runtime(
+        BrowserRuntimeConfig(
+            registration_engine=args.registration_engine,
+            backend=args.browser_backend,
+            roxy_port=args.roxy_port,
+            roxy_token=args.roxy_token,
+            roxy_workspace_id=args.roxy_workspace_id,
+            core_version=args.browser_core_version,
+            os_name=args.browser_os,
+            keep_profile_for_oauth=args.browser_keep_profile_for_oauth,
+            screenshots_enabled=args.browser_screenshots_enabled,
+            asset_cache_enabled=args.browser_asset_cache_enabled,
+        )
     )
 
     inspection_mode = bool(args.doctor or args.status)
@@ -537,7 +626,7 @@ def main() -> None:
                 f"选择={args.cfmail_profile}"
             )
         log_info(
-            f"巡检模式启动：A目录={args.active_token_dir}，A阈值={args.active_min_count}，巡检间隔={args.monitor_interval}秒，注册并发={args.register_openai_concurrency}，批次={args.register_batch_size}，错峰={args.register_start_delay_seconds:.1f}秒，钉钉汇总间隔={args.dingtalk_summary_interval}秒{cfmail_desc}"
+            f"巡检模式启动：A目录={args.active_token_dir}，A阈值={args.active_min_count}，巡检间隔={args.monitor_interval}秒，注册并发={args.register_openai_concurrency}，批次={args.register_batch_size}，错峰={args.register_start_delay_seconds:.1f}秒，钉钉汇总间隔={args.dingtalk_summary_interval}秒，注册引擎={args.registration_engine}{cfmail_desc}"
         )
         run_monitor_loop(
             args,
@@ -550,7 +639,7 @@ def main() -> None:
         builtins.yasal_bypass_ip_choice = True
 
     startup_message = (
-        f"[信息] 脚本启动：注册并发上限={args.register_openai_concurrency}，错峰={args.register_start_delay_seconds:.1f}秒，邮箱服务={args.mail_provider}，Token目录={args.token_dir}"
+        f"[信息] 脚本启动：注册并发上限={args.register_openai_concurrency}，错峰={args.register_start_delay_seconds:.1f}秒，邮箱服务={args.mail_provider}，注册引擎={args.registration_engine}，Token目录={args.token_dir}"
     )
     if args.mail_provider == "cfmail":
         startup_message += (

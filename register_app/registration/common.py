@@ -38,6 +38,7 @@ class RegistrationAttemptResult:
     error_message: str = ""
     provider_key: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
+    private_context: Dict[str, Any] = field(default_factory=dict)
 
     def as_legacy_result(self) -> Optional[Tuple[str, str]]:
         """兼容旧版返回格式。"""
@@ -292,7 +293,9 @@ def _enrich_token_json(
     payload["mail_provider"] = str(mailbox.provider or provider_key or "").strip()
     payload["mailbox"] = _mailbox_public_metadata(mailbox)
     payload["registration_proxy_url"] = str(metadata.get("registration_proxy_url") or "").strip()
-    payload["registration_fingerprint_profile"] = str(metadata.get("impersonate") or "").strip()
+    payload["registration_fingerprint_profile"] = str(
+        metadata.get("fingerprint_profile") or metadata.get("impersonate") or ""
+    ).strip()
     payload["registration_metadata"] = dict(metadata)
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 

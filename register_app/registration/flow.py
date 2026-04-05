@@ -6,10 +6,13 @@ import builtins
 import json
 import logging
 import re
-from typing import Any, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from curl_cffi import requests
 
+from ..browser import is_roxy_configured
+from ..browser.runtime import get_browser_runtime_config
+from ..auth.browser_oauth import try_browser_oauth_password_login
 from ..auth.oauth import (
     bootstrap_web_signup_start_url,
     extract_continue_url_from_response,
@@ -54,14 +57,66 @@ from .mailbox import (
     get_oai_code,
     get_temp_mailbox,
 )
+from .browser_flow import run_browser as _run_browser
 
 logger = logging.getLogger("openai_register")
+_BROWSER_ENGINE_PHASE1_WARNED = False
+
+
+def _mailbox_private_context(mailbox: TempMailbox) -> Dict[str, Any]:
+    return {
+        "email": str(mailbox.email or "").strip(),
+        "provider": str(mailbox.provider or "").strip(),
+        "token": str(mailbox.token or "").strip(),
+        "api_base": str(mailbox.api_base or "").strip(),
+        "login": str(mailbox.login or "").strip(),
+        "domain": str(mailbox.domain or "").strip(),
+        "sid_token": str(mailbox.sid_token or "").strip(),
+        "password": str(mailbox.password or "").strip(),
+        "config_name": str(mailbox.config_name or "").strip(),
+    }
+
+
+def _mailbox_from_private_context(
+    mailbox_context: Optional[Dict[str, Any]],
+    *,
+    fallback_email: str,
+    fallback_provider: str,
+) -> TempMailbox:
+    context = mailbox_context or {}
+    return TempMailbox(
+        email=str(context.get("email") or fallback_email or "").strip(),
+        provider=str(context.get("provider") or fallback_provider or "").strip(),
+        token=str(context.get("token") or "").strip(),
+        api_base=str(context.get("api_base") or "").strip(),
+        login=str(context.get("login") or "").strip(),
+        domain=str(context.get("domain") or "").strip(),
+        sid_token=str(context.get("sid_token") or "").strip(),
+        password=str(context.get("password") or "").strip(),
+        config_name=str(context.get("config_name") or "").strip(),
+    )
+
+
+def _should_try_browser_oauth_fallback(
+    attempt: RegistrationAttemptResult,
+    requested_engine: str,
+) -> bool:
+    if attempt.success:
+        return False
+    if requested_engine not in {"browser", "hybrid"}:
+        return False
+    if str(attempt.error_code or "").strip() != "token_extraction_failed":
+        return False
+    if not str(attempt.email or "").strip() or not str(attempt.password or "").strip():
+        return False
+    mailbox_context = attempt.private_context.get("mailbox") if isinstance(attempt.private_context, dict) else None
+    return isinstance(mailbox_context, dict) and bool(mailbox_context.get("email"))
 
 # ---------------------------------------------------------------------------
 # 核心注册主流程
 # ---------------------------------------------------------------------------
 
-def run(
+def _run_http(
     proxy: Optional[str], provider_key: str, thread_id: int, mailtm_base: str
 ) -> RegistrationAttemptResult:
     """注册主流程。
@@ -198,6 +253,7 @@ def run(
                 "mailbox_duplicate_retries": duplicate_count,
             }
         )
+        result.private_context["mailbox"] = _mailbox_private_context(mailbox)
         logger.info(f"[线程 {thread_id}] [*] 成功获取临时邮箱与授权: {email} ({mailbox.provider})")
 
         oauth = generate_oauth_url()
@@ -607,6 +663,106 @@ def run(
     finally:
         if reserved_mailbox_email:
             mailbox_dedupe_store.release(reserved_mailbox_email)
+
+
+def run(
+    proxy: Optional[str], provider_key: str, thread_id: int, mailtm_base: str
+) -> RegistrationAttemptResult:
+    """注册入口调度器。
+
+    当前策略：
+    - browser: 优先 browser signup，失败后回退 HTTP
+    - hybrid: 优先 HTTP；若 token 提取失败则尝试 browser OAuth fallback；
+      若 HTTP 注册整体失败，再尝试 browser signup
+    """
+    global _BROWSER_ENGINE_PHASE1_WARNED
+
+    browser_runtime = get_browser_runtime_config().normalized()
+    requested_engine = str(
+        getattr(browser_runtime, "registration_engine", "http") or "http"
+    ).strip().lower() or "http"
+    browser_available = is_roxy_configured(browser_runtime)
+    effective_engine = "http"
+
+    if requested_engine in {"browser", "hybrid"} and not _BROWSER_ENGINE_PHASE1_WARNED:
+        logger.warning(
+            "[信息] browser/hybrid 模式已接入 browser signup + browser OAuth fallback；"
+            "当前建议先小流量验证，再逐步放量"
+        )
+        _BROWSER_ENGINE_PHASE1_WARNED = True
+
+    if requested_engine == "browser":
+        if browser_available:
+            browser_result = _run_browser(proxy, provider_key, thread_id, mailtm_base)
+            browser_result.metadata.setdefault("requested_registration_engine", requested_engine)
+            browser_result.metadata.setdefault("effective_registration_engine", "browser")
+            browser_result.metadata["browser_signup_attempted"] = True
+            if browser_result.success:
+                return browser_result
+            logger.warning(
+                f"[线程 {thread_id}] [警告] browser signup 失败，准备回退到 HTTP："
+                f"stage={browser_result.stage or 'unknown'} "
+                f"code={browser_result.error_code or 'unknown'}"
+            )
+        else:
+            logger.warning(f"[线程 {thread_id}] [警告] browser 模式已请求，但 Roxy 配置不完整，准备回退到 HTTP")
+        effective_engine = "http_fallback_from_browser"
+
+    result = _run_http(proxy, provider_key, thread_id, mailtm_base)
+    result.metadata.setdefault("requested_registration_engine", requested_engine)
+    result.metadata.setdefault("effective_registration_engine", effective_engine)
+    if _should_try_browser_oauth_fallback(result, requested_engine):
+        result.metadata["browser_oauth_attempted"] = True
+        logger.info(f"[线程 {thread_id}] [信息] HTTP 注册已完成但 token 提取失败，开始尝试 browser OAuth fallback")
+        browser_oauth_result = try_browser_oauth_password_login(
+            email=result.email,
+            password=result.password,
+            mailbox_context=result.private_context.get("mailbox"),
+            proxy_url=str(proxy or "").strip(),
+            thread_id=thread_id,
+        )
+        if browser_oauth_result:
+            mailbox = _mailbox_from_private_context(
+                result.private_context.get("mailbox"),
+                fallback_email=result.email,
+                fallback_provider=provider_key,
+            )
+            result.metadata.update(browser_oauth_result.metadata)
+            result.metadata["token_source"] = "browser_oauth_fallback"
+            result.metadata["requested_registration_engine"] = requested_engine
+            result.metadata["effective_registration_engine"] = "browser_oauth_fallback"
+            result.success = True
+            result.stage = "completed"
+            result.error_code = ""
+            result.error_message = ""
+            result.token_json = _enrich_token_json(
+                browser_oauth_result.token_json,
+                session=None,
+                mailbox=mailbox,
+                provider_key=provider_key,
+                metadata=result.metadata,
+            )
+            return result
+        result.metadata.setdefault("browser_oauth_attempted", True)
+        result.metadata.setdefault("browser_oauth_success", False)
+
+    if requested_engine == "hybrid" and not result.success and browser_available:
+        logger.info(
+            f"[线程 {thread_id}] [信息] HTTP 注册失败，开始尝试 browser signup fallback："
+            f"stage={result.stage or 'unknown'} code={result.error_code or 'unknown'}"
+        )
+        browser_result = _run_browser(proxy, provider_key, thread_id, mailtm_base)
+        browser_result.metadata.setdefault("requested_registration_engine", requested_engine)
+        browser_result.metadata["browser_signup_attempted"] = True
+        browser_result.metadata["hybrid_http_error_code"] = result.error_code or ""
+        browser_result.metadata["hybrid_http_error_message"] = result.error_message or ""
+        browser_result.metadata["hybrid_http_stage"] = result.stage or ""
+        if browser_result.success:
+            browser_result.metadata["effective_registration_engine"] = "browser_signup_fallback"
+            return browser_result
+        return browser_result
+
+    return result
 
 
 # ---------------------------------------------------------------------------

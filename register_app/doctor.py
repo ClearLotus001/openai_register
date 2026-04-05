@@ -11,6 +11,7 @@ from typing import Any
 
 from curl_cffi import requests
 
+from .browser import BrowserRuntimeConfig, RoxyClient, is_roxy_configured
 from .config import load_config_file
 from .mail.cfmail import cfmail_account_names, get_cfmail_accounts, select_cfmail_account
 from .runtime import count_json_files
@@ -38,6 +39,57 @@ class DoctorReport:
     @property
     def warn_count(self) -> int:
         return sum(1 for item in self.checks if item.status == "warn")
+
+
+def _browser_runtime_from_args(args: Any) -> BrowserRuntimeConfig:
+    return BrowserRuntimeConfig(
+        registration_engine=getattr(args, "registration_engine", "http"),
+        backend=getattr(args, "browser_backend", "roxy"),
+        roxy_port=getattr(args, "roxy_port", 50000),
+        roxy_token=getattr(args, "roxy_token", ""),
+        roxy_workspace_id=getattr(args, "roxy_workspace_id", 0),
+        core_version=getattr(args, "browser_core_version", "145"),
+        os_name=getattr(args, "browser_os", "macOS"),
+        keep_profile_for_oauth=getattr(args, "browser_keep_profile_for_oauth", True),
+        screenshots_enabled=getattr(args, "browser_screenshots_enabled", True),
+        asset_cache_enabled=getattr(args, "browser_asset_cache_enabled", False),
+    ).normalized()
+
+
+def _is_patchright_importable() -> tuple[bool, str]:
+    try:
+        import patchright.async_api  # noqa: F401
+    except Exception as exc:
+        return False, str(exc)
+    return True, "ok"
+
+
+def _stringify_detail(value: Any, *, limit: int = 240) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _extract_roxy_workspace_ids(payload: Any) -> set[int]:
+    workspace_ids: set[int] = set()
+    candidates = payload
+    if isinstance(payload, dict):
+        candidates = payload.get("data", payload)
+    if not isinstance(candidates, list):
+        candidates = [candidates]
+
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        for key in ("workspaceId", "id"):
+            try:
+                value = int(item.get(key) or 0)
+            except Exception:
+                value = 0
+            if value > 0:
+                workspace_ids.add(value)
+    return workspace_ids
 
 
 def _check_config_file(config_path: str) -> DoctorCheck:
@@ -154,6 +206,127 @@ def _check_cfmail(args: Any) -> DoctorCheck:
     )
 
 
+def _check_browser_runtime(args: Any) -> list[DoctorCheck]:
+    runtime = _browser_runtime_from_args(args)
+    detail = (
+        f"engine={runtime.registration_engine} backend={runtime.backend} "
+        f"port={runtime.roxy_port} workspace_id={runtime.roxy_workspace_id}"
+    )
+
+    if runtime.registration_engine == "http":
+        return [
+            DoctorCheck(
+                "browser",
+                "skip",
+                "registration_engine=http，跳过浏览器运行时检查",
+                detail=detail,
+            )
+        ]
+
+    checks: list[DoctorCheck] = []
+    if not is_roxy_configured(runtime):
+        return [
+            DoctorCheck(
+                "browser_config",
+                "error",
+                "浏览器模式已启用，但 Roxy 配置不完整",
+                detail=(
+                    f"{detail} token_set={'yes' if bool(runtime.roxy_token) else 'no'} "
+                    f"workspace_valid={'yes' if runtime.roxy_workspace_id > 0 else 'no'}"
+                ),
+            )
+        ]
+
+    checks.append(
+        DoctorCheck(
+            "browser_config",
+            "ok",
+            "浏览器运行时配置已启用",
+            detail=(
+                f"{detail} keep_profile_for_oauth={runtime.keep_profile_for_oauth} "
+                f"screenshots_enabled={runtime.screenshots_enabled}"
+            ),
+        )
+    )
+
+    patchright_ok, patchright_detail = _is_patchright_importable()
+    checks.append(
+        DoctorCheck(
+            "browser_patchright",
+            "ok" if patchright_ok else "error",
+            "patchright 可导入" if patchright_ok else "patchright 不可导入",
+            detail=_stringify_detail(patchright_detail),
+        )
+    )
+
+    client = RoxyClient(port=runtime.roxy_port, token=runtime.roxy_token)
+    try:
+        health = client.health()
+    except Exception as exc:
+        checks.append(
+            DoctorCheck(
+                "browser_roxy_health",
+                "error",
+                f"Roxy API 不可达：127.0.0.1:{runtime.roxy_port}",
+                detail=_stringify_detail(exc),
+            )
+        )
+        return checks
+
+    checks.append(
+        DoctorCheck(
+            "browser_roxy_health",
+            "ok",
+            f"Roxy API 可达：127.0.0.1:{runtime.roxy_port}",
+            detail=_stringify_detail(json.dumps(health, ensure_ascii=False)),
+        )
+    )
+
+    try:
+        workspaces = client.workspace_project()
+    except Exception as exc:
+        checks.append(
+            DoctorCheck(
+                "browser_roxy_workspace",
+                "warn",
+                "无法获取 Roxy workspace 列表",
+                detail=_stringify_detail(exc),
+            )
+        )
+        return checks
+
+    workspace_ids = _extract_roxy_workspace_ids(workspaces)
+    if workspace_ids and runtime.roxy_workspace_id not in workspace_ids:
+        checks.append(
+            DoctorCheck(
+                "browser_roxy_workspace",
+                "error",
+                f"未在 Roxy workspace 列表中找到目标 workspaceId={runtime.roxy_workspace_id}",
+                detail=f"可用 workspaceIds={sorted(workspace_ids)}",
+            )
+        )
+    elif workspace_ids:
+        checks.append(
+            DoctorCheck(
+                "browser_roxy_workspace",
+                "ok",
+                f"Roxy workspace 有效：{runtime.roxy_workspace_id}",
+                detail=f"可用 workspaceIds={sorted(workspace_ids)}",
+            )
+        )
+    else:
+        checks.append(
+            DoctorCheck(
+                "browser_roxy_workspace",
+                "warn",
+                "Roxy workspace 列表返回成功，但未能解析 workspaceId",
+                detail=_stringify_detail(json.dumps(workspaces, ensure_ascii=False)),
+            )
+        )
+
+    return checks
+
+
 def collect_doctor_report(args: Any) -> DoctorReport:
     checks = [
         _check_config_file(args.config),
@@ -161,6 +334,7 @@ def collect_doctor_report(args: Any) -> DoctorReport:
         _check_proxy(args.proxy),
         _check_cfmail(args),
     ]
+    checks.extend(_check_browser_runtime(args))
     return DoctorReport(
         checked_at=datetime.now().astimezone().isoformat(timespec="seconds"),
         checks=checks,
@@ -168,6 +342,8 @@ def collect_doctor_report(args: Any) -> DoctorReport:
 
 
 def build_status_snapshot(args: Any) -> dict[str, Any]:
+    browser_runtime = _browser_runtime_from_args(args)
+    patchright_ok, patchright_detail = _is_patchright_importable()
     active_count = count_json_files(args.active_token_dir)
     active_shortage = max(int(args.active_min_count) - active_count, 0)
     snapshot: dict[str, Any] = {
@@ -190,6 +366,21 @@ def build_status_snapshot(args: Any) -> dict[str, Any]:
             "register_start_delay_seconds": float(args.register_start_delay_seconds),
             "monitor_interval": int(args.monitor_interval),
             "detected_total_memory_mb": int(getattr(args, "detected_total_memory_mb", 0) or 0),
+        },
+        "browser": {
+            "registration_engine": browser_runtime.registration_engine,
+            "backend": browser_runtime.backend,
+            "roxy_port": browser_runtime.roxy_port,
+            "roxy_workspace_id": browser_runtime.roxy_workspace_id,
+            "roxy_token_set": bool(browser_runtime.roxy_token),
+            "configured": is_roxy_configured(browser_runtime),
+            "core_version": browser_runtime.core_version,
+            "os_name": browser_runtime.os_name,
+            "keep_profile_for_oauth": browser_runtime.keep_profile_for_oauth,
+            "screenshots_enabled": browser_runtime.screenshots_enabled,
+            "asset_cache_enabled": browser_runtime.asset_cache_enabled,
+            "patchright_importable": patchright_ok,
+            "patchright_detail": "" if patchright_ok else _stringify_detail(patchright_detail),
         },
     }
 
@@ -256,6 +447,15 @@ def print_status_snapshot(snapshot: dict[str, Any], *, output_json: bool = False
         "并发："
         f"register_batch_size={runtime.get('register_batch_size', 0)}, "
         f"register_openai_concurrency={runtime.get('register_openai_concurrency', 0)}"
+    )
+    browser = snapshot.get("browser") or {}
+    print(
+        "浏览器："
+        f"engine={browser.get('registration_engine', '')} "
+        f"backend={browser.get('backend', '')} "
+        f"configured={browser.get('configured', False)} "
+        f"workspace_id={browser.get('roxy_workspace_id', 0)} "
+        f"patchright={browser.get('patchright_importable', False)}"
     )
     if snapshot.get("cfmail"):
         cfmail = snapshot["cfmail"]

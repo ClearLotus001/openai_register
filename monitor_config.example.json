@@ -39,6 +39,18 @@
   "_section_proxy": "===== 代理配置 =====",
   "proxy": "",
 
+  "_section_browser": "===== 浏览器注册/兜底配置（可选） =====",
+  "registration_engine": "http",
+  "browser_backend": "roxy",
+  "roxy_port": 50000,
+  "roxy_token": "",
+  "roxy_workspace_id": 0,
+  "browser_core_version": "145",
+  "browser_os": "macOS",
+  "browser_keep_profile_for_oauth": true,
+  "browser_screenshots_enabled": true,
+  "browser_asset_cache_enabled": false,
+
   "_section_flags": "===== 开关（true/false） =====",
   "monitor": true,
   "auto_continue_non_us": true

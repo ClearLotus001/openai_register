@@ -21,6 +21,7 @@ from .common import (
     get_auto_proxy,
 )
 from .flow import _provider_fallback_chain, run, run_with_fallback
+from .browser_flow import run_browser
 from .mailbox import (
     MAILTM_BASE,
     TempMailbox,
@@ -54,5 +55,6 @@ __all__ = [
     "get_oai_code",
     "get_temp_mailbox",
     "run",
+    "run_browser",
     "run_with_fallback",
 ]

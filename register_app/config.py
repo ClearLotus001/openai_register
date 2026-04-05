@@ -35,6 +35,16 @@ DEFAULT_CFMAIL_FALLBACK_PROVIDER = "tempmaillol"
 DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS = 900
 CREATE_ACCOUNT_MAX_ATTEMPTS = 2
 CREATE_ACCOUNT_RETRY_DELAY_SECONDS = 2
+DEFAULT_REGISTRATION_ENGINE = "http"
+DEFAULT_BROWSER_BACKEND = "roxy"
+DEFAULT_ROXY_PORT = 50000
+DEFAULT_ROXY_TOKEN = ""
+DEFAULT_ROXY_WORKSPACE_ID = 0
+DEFAULT_BROWSER_CORE_VERSION = "145"
+DEFAULT_BROWSER_OS = "macOS"
+DEFAULT_BROWSER_KEEP_PROFILE_FOR_OAUTH = True
+DEFAULT_BROWSER_SCREENSHOTS_ENABLED = True
+DEFAULT_BROWSER_ASSET_CACHE_ENABLED = False
 LOW_MEMORY_SOFT_LIMIT_MB = 2560
 LOW_MEMORY_HARD_LIMIT_MB = 1536
 
@@ -68,6 +78,16 @@ _CONFIG_KEY_MAP: Dict[str, str] = {
     "failure_sleep_seconds": "failure_sleep_seconds",
     "cfmail_fail_threshold": "cfmail_fail_threshold",
     "cfmail_cooldown_seconds": "cfmail_cooldown_seconds",
+    "registration_engine": "registration_engine",
+    "browser_backend": "browser_backend",
+    "roxy_port": "roxy_port",
+    "roxy_token": "roxy_token",
+    "roxy_workspace_id": "roxy_workspace_id",
+    "browser_core_version": "browser_core_version",
+    "browser_os": "browser_os",
+    "browser_keep_profile_for_oauth": "browser_keep_profile_for_oauth",
+    "browser_screenshots_enabled": "browser_screenshots_enabled",
+    "browser_asset_cache_enabled": "browser_asset_cache_enabled",
 }
 
 # 布尔型参数（配置文件里 true/false）

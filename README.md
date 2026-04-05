@@ -120,6 +120,37 @@ sudo systemctl status openai-register
 - `dingtalk_summary_interval`
 - `cfmail_profile`
 - `cfmail_config`
+- `registration_engine`
+- `roxy_port`
+- `roxy_token`
+- `roxy_workspace_id`
+
+## 浏览器模式说明
+
+当前支持三种注册引擎：
+
+- `http`
+  - 默认模式，全部走现有 HTTP 注册链路
+- `browser`
+  - 优先走浏览器注册；失败再回退 HTTP
+- `hybrid`
+  - 先走 HTTP
+  - 若只是在 token 提取阶段失败，会尝试浏览器 OAuth fallback
+  - 若 HTTP 整体失败，再尝试浏览器注册 fallback
+
+浏览器模式依赖：
+
+- 本地可用的 RoxyBrowser API
+- 正确的 `roxy_token`
+- 正确的 `roxy_workspace_id`
+- Python 环境可导入 `patchright`
+
+可先用以下命令检查：
+
+```bash
+python openai_register.py --doctor
+python openai_register.py --status
+```
 
 ## 默认节流策略
 

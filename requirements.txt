@@ -2,3 +2,6 @@
 # Verified latest on 2026-03-31:
 #   curl_cffi 0.14.0 (requires Python >= 3.10)
 curl_cffi==0.14.0
+# Verified latest on 2026-04-05:
+#   patchright 1.58.2
+patchright==1.58.2
