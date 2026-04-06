@@ -651,12 +651,69 @@ def try_token_via_existing_session(
 ) -> Optional[str]:
     """尝试复用当前 session 免密获取 token。"""
     logger.info(f"[线程 {thread_id}] [信息] 尝试复用当前 session 免密获取 token")
-    return follow_oauth_redirect_chain(
-        session,
-        oauth_authorize_url(oauth, prompt=None),
-        oauth,
-        thread_id,
+    start_urls: List[tuple[str, str]] = []
+    default_start_url = oauth_authorize_url(oauth, prompt=None)
+    start_urls.append(("oauth_authorize", default_start_url))
+    api_accounts_start_url = default_start_url.replace(
+        "https://auth.openai.com/oauth/authorize",
+        "https://auth.openai.com/api/accounts/authorize",
     )
+    if api_accounts_start_url != default_start_url:
+        start_urls.append(("api_accounts_authorize", api_accounts_start_url))
+
+    seen_start_urls: Set[str] = set()
+    for start_label, start_url in start_urls:
+        if not start_url or start_url in seen_start_urls:
+            continue
+        seen_start_urls.add(start_url)
+        logger.info(f"[线程 {thread_id}] [信息] existing_session 尝试入口: {start_label}")
+
+        try:
+            prime_resp = prime_oauth_session(
+                session,
+                start_url,
+                thread_id,
+                max_hops=8,
+            )
+        except Exception as exc:
+            logger.warning(f"[线程 {thread_id}] [警告] 复用 session 的 OAuth prime 失败({start_label}): {exc}")
+            prime_resp = None
+
+        continue_url = extract_continue_url_from_response(prime_resp) if prime_resp is not None else ""
+        if continue_url:
+            callback_url = _extract_callback_url(continue_url)
+            if callback_url and not _is_chatgpt_web_callback_url(callback_url):
+                try:
+                    return submit_callback_url(
+                        callback_url=callback_url,
+                        expected_state=oauth.state,
+                        code_verifier=oauth.code_verifier,
+                        redirect_uri=oauth.redirect_uri,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[线程 {thread_id}] [警告] prime 后直接回调换 token 失败({start_label}): {exc}"
+                    )
+
+            token_json = follow_oauth_redirect_chain(
+                session,
+                continue_url,
+                oauth,
+                thread_id,
+            )
+            if token_json:
+                return token_json
+
+        token_json = follow_oauth_redirect_chain(
+            session,
+            start_url,
+            oauth,
+            thread_id,
+        )
+        if token_json:
+            return token_json
+
+    return None
 
 
 def try_token_via_continue_url(
@@ -673,7 +730,7 @@ def try_token_via_continue_url(
         return None
     logger.info(f"[线程 {thread_id}] [信息] 尝试直接跟随 continue_url 获取 token")
     callback_url = _extract_callback_url(candidate)
-    if callback_url:
+    if callback_url and not _is_chatgpt_web_callback_url(callback_url):
         try:
             return submit_callback_url(
                 callback_url=callback_url,
@@ -683,6 +740,21 @@ def try_token_via_continue_url(
             )
         except Exception as exc:
             logger.warning(f"[线程 {thread_id}] [警告] continue_url 直接回调换 token 失败: {exc}")
+    elif callback_url and _is_chatgpt_web_callback_url(callback_url):
+        logger.info(
+            f"[线程 {thread_id}] [信息] continue_url 命中 ChatGPT Web callback，先消费网页登录态，再发起 codex OAuth"
+        )
+        web_token_json = _finalize_chatgpt_web_callback(
+            session,
+            callback_url,
+            thread_id,
+            proxy_url=proxy_url,
+        )
+        token_json = try_token_via_existing_session(session, oauth, thread_id)
+        if token_json:
+            return token_json
+        if web_token_json:
+            return web_token_json
     token_json = follow_oauth_redirect_chain(session, candidate, oauth, thread_id)
     if token_json:
         return token_json
@@ -693,6 +765,9 @@ def try_token_via_continue_url(
         proxy_url=proxy_url,
     )
     if token_json:
+        existing_token_json = try_token_via_existing_session(session, oauth, thread_id)
+        if existing_token_json:
+            return existing_token_json
         return token_json
     auth_cookie = str(session.cookies.get("oai-client-auth-session") or "").strip()
     token_json = try_token_via_workspace_select(

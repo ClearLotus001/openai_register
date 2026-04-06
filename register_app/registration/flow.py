@@ -382,6 +382,7 @@ def _run_http(
 
         existing_signup_message_ids: Set[str] = set()
         code = ""
+        otp_send_url = ""
         if is_existing_account:
             logger.info(f"[线程 {thread_id}] [信息] 当前邮箱疑似已存在账号，跳过密码注册与验证码发送，直接进入邮箱验证码校验")
         else:
@@ -453,25 +454,65 @@ def _run_http(
                     failure_detail=otp_detail,
                 )
 
-        _set_stage("email_otp_wait")
-        code = get_oai_code(
-            mailbox,
-            thread_id,
-            proxies,
-            skip_message_ids=existing_signup_message_ids,
-        )
-        wait_reason, wait_diagnostics = _mailbox_wait_failure_reason(mailbox)
-        if wait_diagnostics:
-            result.metadata["otp_wait_diagnostics"] = wait_diagnostics
-        if not code:
-            return _fail(
-                "email_otp_wait",
-                wait_reason,
-                "未获取到注册阶段验证码",
-                affect_cooldown=True,
-                cfmail_reason=wait_reason,
-                otp_wait_diagnostics=wait_diagnostics,
+        seen_signup_message_ids: Set[str] = set(existing_signup_message_ids)
+        signup_otp_attempts = 1 if is_existing_account else 2
+        for otp_attempt in range(1, signup_otp_attempts + 1):
+            _set_stage("email_otp_wait", email_otp_attempt=otp_attempt)
+            code = get_oai_code(
+                mailbox,
+                thread_id,
+                proxies,
+                skip_message_ids=seen_signup_message_ids,
             )
+            wait_reason, wait_diagnostics = _mailbox_wait_failure_reason(mailbox)
+            if wait_diagnostics:
+                result.metadata["otp_wait_diagnostics"] = wait_diagnostics
+            if code:
+                break
+
+            if otp_attempt >= signup_otp_attempts or not otp_send_url:
+                return _fail(
+                    "email_otp_wait",
+                    wait_reason,
+                    "未获取到注册阶段验证码",
+                    affect_cooldown=True,
+                    cfmail_reason=wait_reason,
+                    otp_wait_diagnostics=wait_diagnostics,
+                )
+
+            try:
+                seen_signup_message_ids.update(
+                    get_mailbox_message_snapshot(mailbox, thread_id, proxies)
+                )
+            except Exception:
+                pass
+
+            logger.warning(
+                f"[线程 {thread_id}] [警告] 注册阶段等待验证码超时，准备第 {otp_attempt + 1}/{signup_otp_attempts} 次重新触发发送"
+            )
+            _set_stage("email_otp_resend", email_otp_attempt=otp_attempt + 1)
+            otp_resp = s.get(
+                otp_send_url,
+                headers={
+                    "referer": "https://auth.openai.com/create-account/password",
+                    "accept": "application/json",
+                },
+            )
+            logger.info(
+                f"[线程 {thread_id}] [信息] 注册阶段验证码重发请求已提交，状态码: {otp_resp.status_code}"
+            )
+            if otp_resp.status_code != 200:
+                otp_error_code, otp_error_message = _extract_response_error_code_message(otp_resp)
+                otp_detail = otp_error_message or _resp_detail(otp_resp, limit=800)
+                return _fail(
+                    "email_otp_resend",
+                    otp_error_code or f"email_otp_resend_{otp_resp.status_code}",
+                    otp_detail or "注册阶段邮箱验证码重发失败",
+                    status_code=otp_resp.status_code,
+                    otp_error_code=otp_error_code,
+                    otp_error_message=otp_error_message,
+                    failure_detail=otp_detail,
+                )
 
         _set_stage("email_otp_validate")
         code_resp = post_email_otp_validate(
